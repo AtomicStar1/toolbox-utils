@@ -83,6 +83,9 @@ local State = {
     -- (toolNameFor returns nil) is silently skipped regardless of this.
     SwitchWeapons = { Sword = true, Melee = true, Fruit = false },
     Distance     = 9,         -- studs to hover above/behind the mob (reach is ~10)
+    AutoShadowBoss = false,   -- Shadow Island boss (5min spawn cycle), outranks everything
+    AutoVillain  = false,     -- "Bacon Thief" random-island groups, kill + open the chest
+    AutoDungeon  = false,     -- new dungeon: spend an Orb Dungeon, clear 15 mob waves
     AutoBoss     = false,     -- kill any live boss in workspace.Boss first
     AutoSummon   = false,     -- summon one when none is alive (needs Orb Boss)
     BossPick     = "Any",     -- "Any" or one exact boss name from SpawnBossList
@@ -729,6 +732,117 @@ local function findBoss()
     return best
 end
 
+-- Shadow Island boss (added in the "+UPD" update) -- a single spawn point,
+-- workspace.BossSpawnGroup.Spawn, cycles through boss names on its own timer
+-- (Mob attribute = current name, e.g. "Piccolo"; SpawnDuration/DespawnDuration
+-- in seconds). Once up, the boss itself is just a normal entry in workspace.Mob
+-- under that name -- not a separate Boss-folder system. Verified live: Spawn's
+-- Mob attribute tracks the CURRENT cycle's boss, so read it fresh every check
+-- rather than caching a name, in case it rotates between different bosses.
+local function findShadowBoss()
+    local grp = workspace:FindFirstChild("BossSpawnGroup")
+    local spawn = grp and grp:FindFirstChild("Spawn")
+    local mobName = spawn and spawn:GetAttribute("Mob")
+    if type(mobName) ~= "string" or mobName == "" then return nil end
+    local folder = workspace:FindFirstChild("Mob")
+    local m = folder and folder:FindFirstChild(mobName)
+    if not m then return nil end
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health > 0 then return m end
+    return nil
+end
+
+-- Villains ("Bacon Thief", also new in the "+UPD" update) -- workspace.
+-- MobSpawnGroup has 20 fixed spawn points; when one goes active it gets ~4
+-- "Bacon Thief" mobs in workspace.Mob nearby AND a ChestRef MeshPart (a
+-- ProximityPrompt). First version gated opening on the prompt's ActionText
+-- leaving "Locked" -- confirmed live that text never changes, so that gate
+-- never passed and it fell through to normal farming right after the kill.
+-- Confirmed live instead: the chest becomes actually openable once the 4
+-- Bacon Thief near it are dead, text or not -- so gate on that (no live
+-- Bacon Thief within range of the spawn point) rather than on the prompt's
+-- own label. fireproximityprompt is confirmed broken on this executor
+-- regardless, so the open itself still has to be driven manually
+-- (InputHoldBegin/InputHoldEnd).
+local function findVillain()
+    local folder = workspace:FindFirstChild("Mob")
+    if not folder then return nil end
+    local root = getRoot()
+    local best, bestDist
+    for _, m in ipairs(folder:GetChildren()) do
+        if m.Name == "Bacon Thief" then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local hrp = m:FindFirstChild("HumanoidRootPart")
+            if hum and hrp and hum.Health > 0 then
+                local d = root and (hrp.Position - root.Position).Magnitude or 0
+                if not bestDist or d < bestDist then best, bestDist = m, d end
+            end
+        end
+    end
+    return best
+end
+
+local VILLAIN_GROUP_RADIUS = 60 -- generous -- the 4 mobs in a group were observed
+                                 -- spread up to ~20 studs apart around their spawn point
+
+local function findOpenChest()
+    local grp = workspace:FindFirstChild("MobSpawnGroup")
+    local mobFolder = workspace:FindFirstChild("Mob")
+    if not grp or not mobFolder then return nil end
+    for _, spawn in ipairs(grp:GetChildren()) do
+        local chest = spawn:FindFirstChild("ChestRef")
+        local pp = chest and chest:FindFirstChildOfClass("ProximityPrompt")
+        if pp and pp.Enabled then
+            local groupAlive = false
+            for _, m in ipairs(mobFolder:GetChildren()) do
+                if m.Name == "Bacon Thief" then
+                    local hum = m:FindFirstChildOfClass("Humanoid")
+                    local hrp = m:FindFirstChild("HumanoidRootPart")
+                    if hum and hrp and hum.Health > 0
+                        and (hrp.Position - spawn.Position).Magnitude <= VILLAIN_GROUP_RADIUS then
+                        groupAlive = true
+                        break
+                    end
+                end
+            end
+            if not groupAlive then
+                return chest, pp
+            end
+        end
+    end
+    return nil
+end
+
+local lastChestOpen = 0
+local function tryOpenChest()
+    if os.clock() - lastChestOpen < 1 then return false end
+    local chest, pp = findOpenChest()
+    if not chest then return false end
+    lastChestOpen = os.clock()
+
+    local stand = chest.Position + Vector3.new(0, 3, 3)
+    tpTo(CFrame.lookAt(stand, chest.Position))
+    -- Give the teleport a moment to actually register (both replication to the
+    -- server and ProximityPromptService noticing the prompt is now in range)
+    -- before trying to hold it -- an instant CFrame set immediately followed
+    -- by InputHoldBegin() may fire before either has caught up.
+    task.wait(0.15)
+
+    -- InputHoldBegin/End are undocumented-by-us here (first use in this
+    -- project) -- wrap so a failure shows up as a distinct, greppable status
+    -- instead of silently getting swallowed by stepFarm's outer pcall and
+    -- just looking like "did nothing".
+    local ok, err = pcall(function()
+        pp:InputHoldBegin()
+        task.wait(math.max(pp.HoldDuration, 0.05) + 0.1)
+        pp:InputHoldEnd()
+    end)
+    if not ok then
+        State.Status = "Chest open failed: " .. tostring(err)
+    end
+    return true
+end
+
 -- How many of an item the player holds, read off the Inventory attribute.
 local function ownedCount(itemName)
     local raw = LP:GetAttribute("Inventory")
@@ -1312,6 +1426,278 @@ local function stepLevel()
     engage(mob)
 end
 
+-- Dungeon (new in the "+UPD" update). Confirmed live, start to finish:
+--
+--   1. The NPC is workspace.NpcPrompt["Open Dungeon"] -- NOT "Shop Dungeon",
+--      which sits a few studs away and is only a Dungeon-Point trade shop.
+--      Holding its prompt spends one Orb Dungeon immediately.
+--   2. That opens a LOBBY, not a teleport: a "Start in: 15 / Players: n/12"
+--      counter runs. You have to be standing in the green portal next to the
+--      NPC (the island's own "Portal" part, which is always there and only
+--      goes live during a lobby) when it hits zero. Nothing else confirms it
+--      -- no button, no second prompt.
+--   3. Only then does the server teleport you into the arena. Same
+--      experience, no place teleport -- the character just ends up ~26000
+--      studs out.
+--
+-- Two things had to be got right here, both found the hard way:
+--
+--   * The wait has to happen ACROSS farm-loop passes
+--     (State.DungeonLobbyUntil), not as a blocking task.wait inside one, or
+--     the stuck-detector eventually trips on it.
+--   * You must NOT hold the spot with tpTo. Re-setting CFrame every frame
+--     the way the rest of this script moves the character makes the entry
+--     never register -- measured repeatedly: countdown runs out, orb gone,
+--     no teleport. Walking there with Humanoid:MoveTo and then simply
+--     standing works every time. So the lobby phase deliberately uses MoveTo
+--     and leaves physics alone.
+--
+-- The arena model under workspace.DungeonMap carries a Wave attribute (1-15)
+-- and a Dungeon (uuid) attribute; its mobs are named "Bacon Dungeon" and
+-- carry a matching Dungeon attribute -- needed because workspace.Mob is
+-- server-global, so another player's concurrent run would otherwise mix in.
+-- Wrapped in a do-block on purpose: the Luau compiler caps a chunk (this
+-- whole top-level script) at 200 live local registers, and this file is
+-- already right at that edge. Locals declared inside a block get their
+-- registers freed at the block's `end` instead of staying live for the rest
+-- of the file, and the two entry points are hung off the existing State
+-- table instead of new top-level locals, so this whole feature costs zero
+-- extra top-level registers. Must come after engage() is defined -- it's a
+-- top-level local, and calling it from a function declared earlier in the
+-- file would resolve to a global (nil) instead of this upvalue.
+do
+    local function getMyDungeon()
+        local dm = workspace:FindFirstChild("DungeonMap")
+        local root = getRoot()
+        if not dm or not root then return nil end
+        for _, model in ipairs(dm:GetChildren()) do
+            local center = model:FindFirstChild("Center")
+            if center and (center.Position - root.Position).Magnitude < 500 then
+                return model
+            end
+        end
+        return nil
+    end
+
+    -- Later waves mix in mob types beyond "Bacon Dungeon", so don't filter by
+    -- name -- take anything alive inside the arena. workspace.Mob is
+    -- server-global, so the guard against grabbing someone else's spawn is
+    -- twofold: a radius around this arena's Center (measured: mobs sit within
+    -- ~50 studs of it, and separate arenas are thousands apart), plus
+    -- rejecting anything explicitly tagged for a DIFFERENT dungeon.
+    local ARENA_RADIUS = 300
+
+    local function findDungeonMob(dungeon)
+        local folder = workspace:FindFirstChild("Mob")
+        local center = dungeon:FindFirstChild("Center")
+        if not folder or not center then return nil end
+        local id = dungeon:GetAttribute("Dungeon")
+        local root = getRoot()
+        local best, bestDist
+        for _, m in ipairs(folder:GetChildren()) do
+            local tag = m:GetAttribute("Dungeon")
+            if tag == nil or tag == id then
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                local hrp = m:FindFirstChild("HumanoidRootPart")
+                if hum and hrp and hum.Health > 0
+                    and (hrp.Position - center.Position).Magnitude <= ARENA_RADIUS then
+                    local d = root and (hrp.Position - root.Position).Magnitude or 0
+                    if not bestDist or d < bestDist then best, bestDist = m, d end
+                end
+            end
+        end
+        return best
+    end
+
+    -- Between waves (or once wave 15 is cleared) there's nothing to fight and
+    -- nowhere else to go -- it's an isolated instance -- so just hold near
+    -- the arena center instead of the normal Select/Level fallback wandering
+    -- off. Returns false when we're not in a dungeon at all (nothing to do).
+    -- The green ring you have to stand in during the countdown. It does not
+    -- exist until a dungeon is opened -- workspace.TeleportDungeonZone is
+    -- created then and removed again afterwards, which is why an earlier
+    -- attempt at this could never find it by diffing "parts near the NPC"
+    -- before the fact.
+    --
+    -- Do NOT confuse it with the island's "Portal" model standing right next
+    -- to it. That one is permanent scenery. Aiming at the portal put us at
+    -- z=202.8 while the real hitbox ends at z=201.2 -- barely outside, which
+    -- is exactly why entry worked some runs and silently failed others.
+    local function findTeleportZone()
+        local zone = workspace:FindFirstChild("TeleportDungeonZone")
+        local hb = zone and zone:FindFirstChild("Hitbox")
+        if hb and hb:IsA("BasePart") then return hb end
+        return nil
+    end
+
+    -- Middle of the zone at our own feet height -- the hitbox is ~26 studs
+    -- tall and centred well above the floor, so its own Y is not a place a
+    -- character can stand.
+    local function zoneStandPos()
+        local hb = findTeleportZone()
+        local root = getRoot()
+        if not hb or not root then return nil end
+        return Vector3.new(hb.Position.X, root.Position.Y, hb.Position.Z)
+    end
+
+    -- The dungeon HUD's own "Auto Skip [n/1]" button (PlayerGui.WaveUI).
+    -- Red background = off, green = on; there is no attribute or remote we
+    -- can read or call, and its MouseButton1Click handler is unreachable
+    -- (getconnections returns a stub on this executor), so a real click at
+    -- its screen rect is the only way in. Cheap to re-check, and it costs
+    -- nothing if the button is already green -- the game re-arms it per run,
+    -- so this has to happen on every dungeon, not once per session.
+    local lastSkipCheck = 0
+    local function ensureAutoSkip()
+        if os.clock() - lastSkipCheck < 2 then return end
+        lastSkipCheck = os.clock()
+
+        local wave = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("WaveUI")
+        local btn = wave and wave:FindFirstChild("AutoSkip")
+        if not btn or not btn:IsA("GuiButton") or not btn.Visible then return end
+
+        local c = btn.BackgroundColor3
+        if c.R <= c.G then return end  -- already green
+
+        local inset = GuiService:GetGuiInset()
+        local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+        local cx = p.X + s.X / 2 + inset.X
+        local cy = p.Y + s.Y / 2 + inset.Y
+        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+        task.wait(0.06)
+        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+    end
+
+    function State.stepDungeon()
+        local dungeon = getMyDungeon()
+
+        -- Lobby: orb already spent, countdown running. Stand in the portal
+        -- and do nothing else -- this outranks boss/villain work, because
+        -- wandering off now throws the orb away.
+        if not dungeon and State.DungeonLobbyUntil then
+            if os.clock() < State.DungeonLobbyUntil then
+                State.Status = string.format("Dungeon lobby (%ds)",
+                    math.ceil(State.DungeonLobbyUntil - os.clock()))
+                -- Keep the target honest: the zone only materialises once the
+                -- dungeon is opened, so re-read it here rather than trusting
+                -- whatever was resolved at open time.
+                State.DungeonSpot = zoneStandPos() or State.DungeonSpot
+
+                -- Already placed on the spot by tryOpenDungeon. Deliberately
+                -- do nothing while we're on it: any per-frame reposition and
+                -- the entry never registers. Only nudge back if something
+                -- actually pushed us off, and even then walk, don't teleport.
+                local root, hum = getRoot(), getHumanoid()
+                if root and hum and State.DungeonSpot
+                    and (root.Position - State.DungeonSpot).Magnitude > 6 then
+                    hum:MoveTo(State.DungeonSpot)
+                end
+                return true
+            end
+            State.DungeonLobbyUntil = nil
+            State.DungeonSpot = nil
+            State.Status = "Dungeon start timed out"
+            return false
+        end
+
+        if not dungeon then return false end
+        -- We made it in, so the lobby wait is over regardless of how much
+        -- time was left on its timeout.
+        State.DungeonLobbyUntil = nil
+        State.DungeonSpot = nil
+
+        ensureAutoSkip()
+
+        local wave = dungeon:GetAttribute("Wave")
+        local mob = findDungeonMob(dungeon)
+        if mob then
+            State.Status = "Dungeon wave " .. tostring(wave) .. "/15"
+            engage(mob)
+            return true
+        end
+        State.Status = "Dungeon: waiting (wave " .. tostring(wave) .. "/15)"
+        local center = dungeon:FindFirstChild("Center")
+        local root = getRoot()
+        if center and root and (center.Position - root.Position).Magnitude > 15 then
+            tpTo(CFrame.new(center.Position + Vector3.new(0, 3, 0)))
+        end
+        return true
+    end
+
+    -- Countdown was 15s when measured; allow well over that so a longer one
+    -- (it scales with players joining, up to 12) still gets sat out, but the
+    -- orb isn't written off forever if the teleport never comes.
+    local LOBBY_TIMEOUT = 45
+    -- Long enough that a failed attempt doesn't burn a second orb straight
+    -- away -- one orb per retry is the actual cost of getting this wrong.
+    local RETRY_GAP = 25
+
+    function State.tryOpenDungeon()
+        -- The lobby wait itself lives in stepDungeon, which runs first.
+        if State.DungeonLobbyUntil then return false end
+        if os.clock() - (State.LastDungeonAttempt or 0) < RETRY_GAP then return false end
+        if ownedCount("Orb Dungeon") <= 0 then
+            State.Status = "Need Orb Dungeon"
+            return false
+        end
+
+        local npc = workspace:FindFirstChild("NpcPrompt")
+            and workspace.NpcPrompt:FindFirstChild("Open Dungeon")
+        local hrp = npc and npc:FindFirstChild("HumanoidRootPart")
+        local pp = hrp and hrp:FindFirstChildOfClass("ProximityPrompt")
+        if not pp then return false end
+
+        State.LastDungeonAttempt = os.clock()
+
+        -- Stand just off the NPC, facing it: inside prompt range (10 studs)
+        -- and inside the ring that is about to appear around it.
+        local spot = CFrame.lookAt(hrp.Position + Vector3.new(0, 3, 3), hrp.Position)
+        tpTo(spot)
+        -- The prompt only counts us as in range once the move has actually
+        -- replicated. 0.2s was not enough -- measured a run where the hold
+        -- silently did nothing, no orb spent, and the lobby wait then sat
+        -- there for its full timeout on a dungeon that was never opened.
+        task.wait(0.8)
+
+        local orbsBefore = ownedCount("Orb Dungeon")
+
+        -- fireproximityprompt is broken on this executor, but driving the
+        -- hold by hand does work -- verified by watching the prompt's own
+        -- progress bar climb (Progress NumberValue under PlayerGui) and the
+        -- orb count actually drop.
+        local ok, err = pcall(function()
+            pp:InputHoldBegin()
+            task.wait(math.max(pp.HoldDuration, 0.05) + 0.2)
+            pp:InputHoldEnd()
+        end)
+        if not ok then
+            State.Status = "Dungeon open failed: " .. tostring(err)
+            return true
+        end
+
+        -- Confirm the hold actually took before committing to a 45s wait.
+        -- The only reliable signal is the orb leaving the inventory; the
+        -- prompt's own ActionText stays "Need Orb Dungeon" either way and is
+        -- useless here.
+        task.wait(1)
+        if ownedCount("Orb Dungeon") >= orbsBefore then
+            State.Status = "Dungeon open didn't take"
+            return true
+        end
+
+        -- The zone spawns with the dungeon, so it should be there now.
+        State.DungeonSpot = zoneStandPos() or hrp.Position
+
+        -- Put us on the spot once, here, and then leave the character alone
+        -- for the whole countdown (see the lobby branch in stepDungeon).
+        tpTo(CFrame.new(State.DungeonSpot))
+
+        State.DungeonLobbyUntil = os.clock() + LOBBY_TIMEOUT
+        State.Status = "Dungeon lobby"
+        return true
+    end
+end
+
 local function stepFarm()
     local hum = getHumanoid()
     local root = getRoot()
@@ -1338,6 +1724,23 @@ local function stepFarm()
     cacheNpcHomes()
     rememberMobs()
 
+    -- Inside the arena, nothing else applies -- it's an isolated instance,
+    -- there's nothing else reachable there anyway.
+    if State.AutoDungeon and State.stepDungeon() then
+        return
+    end
+
+    -- The Shadow Island boss outranks everything -- it's a rare timed spawn,
+    -- worth dropping even a regular boss fight for.
+    if State.AutoShadowBoss then
+        local shadowBoss = findShadowBoss()
+        if shadowBoss then
+            State.Status = "Shadow Boss: " .. shadowBoss.Name
+            engage(shadowBoss)
+            return
+        end
+    end
+
     -- A live boss outranks whatever else we were doing.
     if State.AutoBoss then
         local boss = findBoss()
@@ -1348,6 +1751,31 @@ local function stepFarm()
         elseif State.AutoSummon then
             if trySummonBoss() then return end
         end
+    end
+
+    -- Villains: a timed random-island event, worth prioritizing over routine
+    -- quest farming but not worth dropping an actual boss fight for. Try an
+    -- already-unlocked chest first (cheap check, don't want one sitting open
+    -- while we wander off to fight something else), then fall back to
+    -- fighting whatever Bacon Thief is still up.
+    if State.AutoVillain then
+        if tryOpenChest() then
+            State.Status = "Opening chest"
+            return
+        end
+        local villain = findVillain()
+        if villain then
+            State.Status = "Villain: " .. villain.Name
+            engage(villain)
+            return
+        end
+    end
+
+    -- Not inside one yet: try to start a run if we have an orb for it. Low
+    -- priority on purpose -- shouldn't interrupt boss/villain content just
+    -- to go spend an orb.
+    if State.AutoDungeon then
+        if State.tryOpenDungeon() then return end
     end
 
     if State.FarmMode == "Select" then
@@ -1528,7 +1956,22 @@ task.spawn(function()
     while getgenv().__RFF_GEN == MY_GEN do
         task.wait(5)
 
-        if not State.AutoFarm then
+        -- Dungeon phases legitimately produce no kills for a while: the
+        -- lobby countdown is a fixed wait, and between waves the arena is
+        -- simply empty. Neither is a stall, and a "reset character" here
+        -- would throw away the run (and the orb) outright.
+        local inDungeonPhase = State.AutoDungeon and (State.DungeonLobbyUntil ~= nil or (function()
+            local dm = workspace:FindFirstChild("DungeonMap")
+            local root = getRoot()
+            if not dm or not root then return false end
+            for _, m in ipairs(dm:GetChildren()) do
+                local c = m:FindFirstChild("Center")
+                if c and (c.Position - root.Position).Magnitude < 500 then return true end
+            end
+            return false
+        end)())
+
+        if not State.AutoFarm or inDungeonPhase then
             lastKills = State.Kills
             lastChange = os.clock()
             resets = 0
@@ -2860,6 +3303,9 @@ end)
 
 sectionLabel(pageFarm, "Boss")
 
+toggleRow(pageFarm, Icon.flame, "Auto Shadow Boss", "AutoShadowBoss")
+toggleRow(pageFarm, Icon.package, "Auto Villains", "AutoVillain")
+toggleRow(pageFarm, Icon.activity, "Auto Dungeon", "AutoDungeon")
 toggleRow(pageFarm, Icon.crosshair, "Auto Boss", "AutoBoss")
 toggleRow(pageFarm, Icon.star, "Auto Summon Boss", "AutoSummon")
 
